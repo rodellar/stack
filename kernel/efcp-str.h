@@ -111,6 +111,18 @@ struct rtxq {
         struct rtxqueue *         queue;
 };
 
+struct rtt_entry {
+		unsigned long time_stamp;
+		seq_num_t sn;
+        struct list_head next;
+};
+
+struct rttq {
+		spinlock_t lock;
+		struct dtp * parent;
+        struct list_head head;
+};
+
 /* This is the DT-SV part maintained by DTP */
 struct dtp_sv {
         uint_t       max_flow_pdu_size;
@@ -150,12 +162,13 @@ struct dtp {
 
         struct cwq *        cwq;
         struct rtxq *       rtxq;
+        struct rttq *       rttq;
 
         /*
          * NOTE: The DTP State Vector is discarded only after and explicit
          *       release by the AP or by the system (if the AP crashes).
          */
-        struct dtp_sv *           sv; /* The state-vector */
+        struct dtp_sv * 	sv; /* The state-vector */
         spinlock_t          sv_lock; /* The state vector lock (DTP & DTCP) */
 
         struct rina_component     base;
@@ -170,10 +183,11 @@ struct dtp {
                 struct timer_list a;
                 struct timer_list rate_window;
                 struct timer_list rtx;
+                struct timer_list rendezvous;
         } timers;
-	struct robject		  robj;
+        struct robject	robj;
 
-	spinlock_t          lock;
+        spinlock_t		lock;
 };
 
 /* This is the DT-SV part maintained by DTCP */
@@ -267,10 +281,10 @@ struct dtcp_sv {
 
         /* Rate based both in and out-bound */
 
-	/* Last time-instant when the credit check has been done.
-	 * This is used by rate-based flow control mechanism.
-	 */
-	struct timespec last_time;
+		/* Last time-instant when the credit check has been done.
+		 * This is used by rate-based flow control mechanism.
+		 */
+		struct timespec last_time;
 
         /*
          * Control of duplicated control PDUs
@@ -282,6 +296,18 @@ struct dtcp_sv {
         uint_t       rtt;
         uint_t       srtt;
         uint_t       rttvar;
+
+        /* Rendezvous */
+
+        /* This Boolean indicates whether there is a zero-length window and a
+         * Rendezvous PDU has been sent.
+         */
+        bool         rendezvous_sndr;
+
+        /* This Boolean indicates whether a Rendezvous PDU was received. The
+         * next DT-PDU is expected to have a DRF bit set to true.
+         */
+        bool         rendezvous_rcvr;
 };
 
 struct dtcp {
@@ -295,9 +321,10 @@ struct dtcp {
         struct rina_component  base;
         struct dtcp_config *   cfg;
         struct rmt *           rmt;
+        struct timer_list 	   rendezvous_rcv;
 
         atomic_t               cpdus_in_transit;
-	struct robject         robj;
+        struct robject         robj;
 };
 
 
