@@ -45,59 +45,74 @@ struct dctcp_dtcp_ps_data {
 	uint_t        sent_total;
 	uint_t        ecn_total;
 	uint_t        dctcp_alpha;
+	uint_t	      obs_window_size;
 };
-
-static void update_credit_and_rt_wind_edge(struct dtcp * dtcp, uint_t credit)
-{
-	spin_lock_bh(&dtcp->parent->sv_lock);
-	dtcp->sv->rcvr_credit = credit;
-	/* applying the TCP rule of not shrinking the window */
-	if (dtcp->parent->sv->rcv_left_window_edge + credit >
-		dtcp->sv->rcvr_rt_wind_edge)
-		dtcp->sv->rcvr_rt_wind_edge =
-				dtcp->parent->sv->rcv_left_window_edge + credit;
-	spin_unlock_bh(&dtcp->parent->sv_lock);
-}
 
 static int dctcp_rcvr_flow_control(struct dtcp_ps * ps, const struct pci * pci)
 {
 	struct dtcp * dtcp = ps->dm;
 	struct dctcp_dtcp_ps_data * data = ps->priv;
-	seq_num_t new_credit;
+	seq_num_t cwnd;
 	uint_t alpha_old = 0;
 
 	spin_lock_bh(&dtcp->parent->sv_lock);
-	new_credit = dtcp->sv->rcvr_credit;
-	if (data->state == SLOW_START) {
-		new_credit++;
-		if (new_credit >= data->sshtresh) {
-			data->state = CONG_AVOID;
-		}
+	cwnd = dtcp->sv->rcvr_credit;
+
+	/* Check if we must abandon Slow Start state */
+	if (cwnd >= data->sshtresh) {
+		data->state = CONG_AVOID;
+	}
+
+	/* Update congestion window */
+	data->sent_total++;
+	if ((pci_flags_get(pci) & PDU_FLAGS_EXPLICIT_CONGESTION)) {
+		/* PDU is ECN-marked, decrease cwnd value */
+		data->ecn_total++;
+		cwnd = max(cwnd -
+			  ((cwnd * data->dctcp_alpha) >> 11U), 2U);
+
+		/* Decrease sshthresh and go back to CONG_AVOID */
+		data->sshtresh = cwnd;
+		data->state = CONG_AVOID;
+	} else if (data->state == SLOW_START) {
+		/* Increase credit by one */
+		cwnd++;
 	} else {
-		data->dec_credit += DEC_PRECISION/new_credit;
+		/* CA state, increase by 1/cwnd */
+		data->dec_credit += DEC_PRECISION/cwnd;
 		if (data->dec_credit >= DEC_PRECISION) {
-			new_credit++;
+			cwnd++;
 			data->dec_credit -= DEC_PRECISION;
 		}
 	}
-	spin_unlock_bh(&dtcp->parent->sv_lock);
-	data->sent_total++;
-	alpha_old = data->dctcp_alpha;
-	if ((pci_flags_get(pci) & PDU_FLAGS_EXPLICIT_CONGESTION)) {
-		data->ecn_total++;
+
+	/* Update credit and right window edge */
+	dtcp->sv->rcvr_credit = cwnd;
+
+	/* applying the TCP rule of not shrinking the window */
+	if (dtcp->parent->sv->rcv_left_window_edge + cwnd >
+		dtcp->sv->rcvr_rt_wind_edge)
+		dtcp->sv->rcvr_rt_wind_edge =
+			dtcp->parent->sv->rcv_left_window_edge + cwnd;
+
+	/* Update alpha once every observation window */
+	if (data->sent_total >= data->obs_window_size) {
+		LOG_DBG("Received %u PDUs, with %u marked PDUs in this window",
+			data->sent_total, data->ecn_total);
 		/* alpha = (1-g) * alpha + g * F according DCTCP kernel patch */
+		alpha_old = data->dctcp_alpha;
 		data->dctcp_alpha = alpha_old - (alpha_old >> data->shift_g) +
 				(data->ecn_total << (10 - data->shift_g)) / data->sent_total;
-		new_credit = max(new_credit -
-				((new_credit * data->dctcp_alpha) >> 11U), 2U);
-		data->sshtresh = new_credit;
-		data->state = CONG_AVOID;
-		LOG_DBG("DCTCP DTCP: dctcp_alpha: %d, new_credit %d",
-			data->dctcp_alpha, new_credit);
+
+		data->sent_total = 0;
+		data->ecn_total = 0;
+		data->obs_window_size = cwnd;
 	}
 
-	/* set the new credit */
-	update_credit_and_rt_wind_edge(dtcp, new_credit);
+	LOG_DBG("New credit is %u, Alpha is %u, # of PDUs with ECN set %u",
+			cwnd, data->dctcp_alpha, data->ecn_total);
+
+	spin_unlock_bh(&dtcp->parent->sv_lock);
 
 	return 0;
 }
@@ -148,6 +163,7 @@ static struct ps_base * dtcp_ps_dctcp_create(struct rina_component * component)
 	data->shift_g = 4;
 	data->sent_total = 0;
 	data->ecn_total = 0;
+	data->obs_window_size = data->init_credit;
 	dtcp->sv->rcvr_credit = data->init_credit;
 
 	ps->base.set_policy_set_param   = dtcp_ps_set_policy_set_param;

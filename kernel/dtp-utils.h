@@ -59,8 +59,6 @@ int		    rtxq_drop_pdus(struct rtxq * q);
 unsigned long       rtxq_entry_timestamp(struct rtxq * q,
                                          seq_num_t sn);
 int                 rtxq_entry_destroy(struct rtxq_entry * entry);
-int                 rtxq_push_sn(struct rtxq * q,
-                                 seq_num_t sn);
 int                 rtxq_push_ni(struct rtxq * q,
                                  struct du *  du);
 int                 rtxq_ack(struct rtxq * q,
@@ -72,15 +70,15 @@ int                 rtxq_nack(struct rtxq * q,
 int                 rtxq_flush(struct rtxq * q);
 
 int 		    dtp_pdu_send(struct dtp *  dtp,
-				 	 	 	 struct rmt * rmt,
-							 struct du * du);
+				 struct rmt * rmt,
+                                 struct du * du);
 
 struct rttq;
 
-struct rttq * rttq_create(void);
-int rttq_destroy(struct rttq * q);
-unsigned long rttq_entry_timestamp(struct rttq * q, seq_num_t sn);
-int rttq_drop(struct rttq * q, seq_num_t sn);
-int rttq_push(struct rttq * q, seq_num_t sn);
-int rttq_flush(struct rttq * q);
+struct rttq * 	    rttq_create(void);
+int 		    rttq_destroy(struct rttq * q);
+unsigned long 	    rttq_entry_timestamp(struct rttq * q, seq_num_t sn);
+int 		    rttq_drop(struct rttq * q, seq_num_t sn);
+int 		    rttq_push(struct rttq * q, seq_num_t sn);
+int 		    rttq_flush(struct rttq * q);
 #endif

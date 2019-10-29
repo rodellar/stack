@@ -112,14 +112,14 @@ struct rtxq {
 };
 
 struct rtt_entry {
-		unsigned long time_stamp;
-		seq_num_t sn;
+	unsigned long time_stamp;
+	seq_num_t sn;
         struct list_head next;
 };
 
 struct rttq {
-		spinlock_t lock;
-		struct dtp * parent;
+	spinlock_t lock;
+	struct dtp * parent;
         struct list_head head;
 };
 
@@ -162,7 +162,7 @@ struct dtp {
 
         struct cwq *        cwq;
         struct rtxq *       rtxq;
-        struct rttq *       rttq;
+        struct rttq * 	    rttq;
 
         /*
          * NOTE: The DTP State Vector is discarded only after and explicit

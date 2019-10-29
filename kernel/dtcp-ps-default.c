@@ -111,9 +111,15 @@ int default_sender_ack(struct dtcp_ps * ps, seq_num_t seq_num)
                 }
 
                 spin_lock_bh(&dtcp->parent->sv_lock);
+
                 tr = dtcp->parent->sv->tr;
-                spin_unlock_bh(&dtcp->parent->sv_lock);
+
                 rtxq_ack(dtcp->parent->rtxq, seq_num, tr);
+
+                /* Update LWE */
+                dtcp->sv->snd_lft_win = seq_num + 1;
+
+                spin_unlock_bh(&dtcp->parent->sv_lock);
         }
 
         return 0;
@@ -200,7 +206,8 @@ int default_rcvr_flow_control(struct dtcp_ps * ps, const struct pci * pci)
         spin_unlock_bh(&dtcp->parent->sv_lock);
 
         if (dtcp->sv->rendezvous_rcvr) {
-                LOG_INFO("DTCP: LWE: %u  RWE: %u -- PCI: lwe: %u, rwe: %u", LWE, RWE, lwe_p, rwe_p);
+                LOG_DBG("DTCP: LWE: %u  RWE: %u -- PCI: lwe: %u, rwe: %u",
+                	LWE, RWE, lwe_p, rwe_p);
         }
 
         return 0;
@@ -241,170 +248,176 @@ int default_rate_reduction(struct dtcp_ps * ps, const struct pci * pci)
 
 static int rtt_calculation(struct dtcp_ps * ps, timeout_t start_time)
 {
-    	struct dtcp *       dtcp;
-    	uint_t              rtt, new_sample, srtt, rttvar, trmsecs;
-    	timeout_t           a;
-    	int                 abs;
+	struct dtcp *       dtcp;
+	uint_t              rtt, new_sample, srtt, rttvar, trmsecs;
+	timeout_t           a;
+	int                 abs;
 
-        if (!ps)
-                return -1;
-        dtcp = ps->dm;
-        if (!dtcp)
-                return -1;
+	if (!ps)
+		return -1;
+	dtcp = ps->dm;
+	if (!dtcp)
+		return -1;
 
-    	new_sample = jiffies_to_msecs(jiffies - start_time);
+	new_sample = jiffies_to_msecs(jiffies - start_time);
 
-    	spin_lock_bh(&dtcp->parent->sv_lock);
+	spin_lock_bh(&dtcp->parent->sv_lock);
 
-    	rtt    = dtcp->sv->rtt;
-    	srtt   = dtcp->sv->srtt;
-    	rttvar = dtcp->sv->rttvar;
-    	a 	   = dtcp->parent->sv->A;
+	rtt    = dtcp->sv->rtt;
+	srtt   = dtcp->sv->srtt;
+	rttvar = dtcp->sv->rttvar;
+	a      = dtcp->parent->sv->A;
 
-    	if (!rtt) {
-    			rtt    = new_sample;
-    			rttvar = new_sample >> 1;
-    			srtt   = new_sample;
-    	} else {
-    			/* RTT <== RTT * (112/128) + SAMPLE * (16/128)*/
-    			rtt = (rtt * 112 + (new_sample << 4)) >> 7;
-    			abs = srtt - new_sample;
-    			abs = abs < 0 ? -abs : abs;
-    			rttvar = ((3 * rttvar) >> 2) + (((uint_t)abs) >> 2);
-    	}
+	if (!rtt) {
+		rtt    = new_sample;
+		rttvar = new_sample >> 1;
+		srtt   = new_sample;
+	} else {
+		/* RTT <== RTT * (112/128) + SAMPLE * (16/128)*/
+		rtt = (rtt * 112 + (new_sample << 4)) >> 7;
+		abs = srtt - new_sample;
+		abs = abs < 0 ? -abs : abs;
+		rttvar = ((3 * rttvar) >> 2) + (((uint_t)abs) >> 2);
+	}
 
-    	/*FIXME: k, G, alpha and betha should be parameters passed to the policy
-    	 * set. Probably moving them to ps->priv */
+	/* FIXME: k, G, alpha and betha should be parameters passed to the
+	 * policy set. Probably moving them to ps->priv */
 
-    	/* k * rttvar = 4 * rttvar */
-    	trmsecs  = rttvar << 2;
-    	/* G is 0.1s according to RFC6298, then 100ms */
-    	trmsecs  = 100 > trmsecs ? 100 : trmsecs;
-    	trmsecs += srtt + jiffies_to_msecs(a);
-    	/* RTO (tr) less than 1s? (not for the common policy) */
-    	/*trmsecs  = trmsecs < 1000 ? 1000 : trmsecs;*/
+	/* k * rttvar = 4 * rttvar */
+	trmsecs  = rttvar << 2;
+	/* G is 0.1s according to RFC6298, then 100ms */
+	trmsecs  = 100 > trmsecs ? 100 : trmsecs;
+	trmsecs += srtt + jiffies_to_msecs(a);
+	/* RTO (tr) less than 1s? (not for the common policy) */
+	/*trmsecs  = trmsecs < 1000 ? 1000 : trmsecs;*/
 
-    	dtcp->sv->rtt = rtt;
-    	dtcp->sv->rttvar = rttvar;
-    	dtcp->sv->srtt = srtt;
-    	dtcp->parent->sv->tr = msecs_to_jiffies(trmsecs);
+	dtcp->sv->rtt = rtt;
+	dtcp->sv->rttvar = rttvar;
+	dtcp->sv->srtt = srtt;
+	dtcp->parent->sv->tr = msecs_to_jiffies(trmsecs);
 
-    	spin_unlock_bh(&dtcp->parent->sv_lock);
+	LOG_DBG("RTT estimated at %u", rtt);
 
-    	return 0;
+	spin_unlock_bh(&dtcp->parent->sv_lock);
+
+	return 0;
 }
 
 int default_rtt_estimator(struct dtcp_ps * ps, seq_num_t sn)
 {
-        struct dtcp *       dtcp;
-        timeout_t           start_time;
+	struct dtcp *       dtcp;
+	timeout_t           start_time;
 
-        if (!ps)
-                return -1;
-        dtcp = ps->dm;
-        if (!dtcp)
-                return -1;
+	if (!ps)
+		return -1;
+	dtcp = ps->dm;
+	if (!dtcp)
+		return -1;
 
-        LOG_DBG("RTT Estimator...");
+	LOG_DBG("RTT Estimator...");
 
-        start_time = rtxq_entry_timestamp(dtcp->parent->rtxq, sn);
-        if (start_time == 0) {
-        		LOG_DBG("RTTestimator: PDU %u has been retransmitted", sn);
-                return 0;
-        }
+	start_time = rtxq_entry_timestamp(dtcp->parent->rtxq, sn);
+	if (start_time == 0) {
+		LOG_DBG("RTTestimator: PDU %u has been retransmitted", sn);
+		return 0;
+	} else if (start_time == -1) {
+		/* The PDU being ACKed is no longer in the RTX queue */
+		return -1;
+	}
 
-        rtt_calculation(ps, start_time);
+	rtt_calculation(ps, start_time);
 
-        return 0;
+	return 0;
 }
 
 int default_rtt_estimator_nortx(struct dtcp_ps * ps, seq_num_t sn)
 {
-		struct dtcp *       dtcp;
-		timeout_t           start_time;
+	struct dtcp *       dtcp;
+	timeout_t           start_time;
 
-		if (!ps)
-				return -1;
-		dtcp = ps->dm;
-		if (!dtcp)
-				return -1;
+	if (!ps)
+		return -1;
+	dtcp = ps->dm;
+	if (!dtcp)
+		return -1;
 
-		LOG_DBG("RTT Estimator with only flow control...");
+	LOG_DBG("RTT Estimator with only flow control...");
 
-		start_time = rttq_entry_timestamp(dtcp->parent->rttq, sn);
-		if (start_time == 0) {
-				LOG_DBG("RTTestimator: PDU %u has been retransmitted", sn);
-				return 0;
-		}
-
-		rtt_calculation(ps, start_time);
-
+	start_time = rttq_entry_timestamp(dtcp->parent->rttq, sn);
+	if (start_time == 0) {
 		return 0;
+	}
+
+	rtt_calculation(ps, start_time);
+
+	return 0;
 }
 
 int default_rcvr_rendezvous(struct dtcp_ps * ps, const struct pci * pci)
 {
-        struct dtcp *       dtcp;
-        seq_num_t rcv_lft, rcv_rt, snd_lft, snd_rt;
-        timeout_t rv;
+	struct dtcp *       dtcp;
+	seq_num_t rcv_lft, rcv_rt, snd_lft, snd_rt;
+	timeout_t rv;
 
-        if (!ps)
-                return -1;
-        dtcp = ps->dm;
-        if (!dtcp)
-                return -1;
+	if (!ps)
+		return -1;
+	dtcp = ps->dm;
+	if (!dtcp)
+		return -1;
 
-        spin_lock_bh(&dtcp->parent->sv_lock);
-        /* TODO: check if retransmission control enabled */
+	spin_lock_bh(&dtcp->parent->sv_lock);
+	/* TODO: check if retransmission control enabled */
 
-        if (dtcp->parent->sv->window_based) {
-        	rcv_lft = pci_control_new_left_wind_edge(pci);
-        	rcv_rt = pci_control_new_rt_wind_edge(pci);
-        	snd_lft = pci_control_my_left_wind_edge(pci);
-        	snd_rt = pci_control_my_rt_wind_edge(pci);
+	if (dtcp->parent->sv->window_based) {
+		rcv_lft = pci_control_new_left_wind_edge(pci);
+		rcv_rt = pci_control_new_rt_wind_edge(pci);
+		snd_lft = pci_control_my_left_wind_edge(pci);
+		snd_rt = pci_control_my_rt_wind_edge(pci);
 
-        	/* Check Consistency of the Receiving Window values with the
-        	 * values in the PDU.
-        	 */
-        	if (dtcp->sv->snd_lft_win != rcv_lft) {
-        		/* TODO what to do? */
-        	}
+		/* Check Consistency of the Receiving Window values with the
+		 * values in the PDU.
+		 */
+		if (dtcp->sv->snd_lft_win != rcv_lft) {
+			/* TODO what to do? */
+		}
 
-        	if (dtcp->sv->snd_rt_wind_edge != rcv_rt) {
-        		/* TODO what to do? */
-        	}
-    		LOG_DBG("RCVR rendezvous. RCV LWE: %u | RCV RWE: %u || SND LWE: %u | SND RWE: %u",
-					dtcp->parent->sv->rcv_left_window_edge, dtcp->sv->rcvr_rt_wind_edge,
-					snd_lft, snd_rt);
+		if (dtcp->sv->snd_rt_wind_edge != rcv_rt) {
+			/* TODO what to do? */
+		}
+		LOG_DBG("RCVR rendezvous. RCV LWE: %u | RCV RWE: %u || "
+				"SND LWE: %u | SND RWE: %u",
+			dtcp->parent->sv->rcv_left_window_edge,
+			dtcp->sv->rcvr_rt_wind_edge, snd_lft, snd_rt);
 
-    		dtcp->sv->rcvr_rt_wind_edge = snd_lft + dtcp->sv->rcvr_credit;
-        }
+		dtcp->sv->rcvr_rt_wind_edge = snd_lft + dtcp->sv->rcvr_credit;
+	}
 
-        if (dtcp->sv->flow_ctl && dtcp->parent->sv->rate_based) {
-        	/* TODO implement */
-        }
+	if (dtcp->sv->flow_ctl && dtcp->parent->sv->rate_based) {
+		/* TODO implement */
+	}
 
-        /* TODO Receiver is in the Rendezvous-at-the-receiver state. The next PDU is
-         * expected to have DRF bit set to true
-         */
+	/* TODO Receiver is in the Rendezvous-at-the-receiver state. The next PDU is
+	 * expected to have DRF bit set to true
+	 */
 
-    	dtcp->sv->rendezvous_rcvr = true;
+	dtcp->sv->rendezvous_rcvr = true;
 
-        spin_unlock_bh(&dtcp->parent->sv_lock);
+	spin_unlock_bh(&dtcp->parent->sv_lock);
 
-        /* Send a ControlAck PDU to confirm reception of RendezvousPDU via
-         * lastControlPDU value or send any other control PDU with Flow Control
-         * information opening the window.
-         */
-        if (dtcp->sv->rcvr_credit != 0) {
-    		rv = jiffies_to_msecs(dtcp->parent->sv->tr);
-        	rtimer_start(&dtcp->rendezvous_rcv, rv);
-        }
+	/* Send a ControlAck PDU to confirm reception of RendezvousPDU via
+	 * lastControlPDU value or send any other control PDU with Flow Control
+	 * information opening the window.
+	 */
+	if (dtcp->sv->rcvr_credit != 0) {
+		rv = jiffies_to_msecs(dtcp->parent->sv->tr);
+		rtimer_start(&dtcp->rendezvous_rcv, rv);
+	}
 
-    	atomic_inc(&dtcp->cpdus_in_transit);
-    	LOG_INFO("DTCP 1st Sending FC to stop Rendezvous (CPU: %d)", smp_processor_id());
+	atomic_inc(&dtcp->cpdus_in_transit);
+	LOG_DBG("DTCP 1st Sending FC to stop Rendezvous (CPU: %d)",
+		smp_processor_id());
 
-    	return ctrl_pdu_send(dtcp, PDU_TYPE_FC, true);
+	return ctrl_pdu_send(dtcp, PDU_TYPE_FC, true);
 }
 
 struct ps_base * dtcp_ps_default_create(struct rina_component * component)
@@ -421,11 +434,11 @@ struct ps_base * dtcp_ps_default_create(struct rina_component * component)
         ps->priv                        = NULL;
         ps->flow_init                   = NULL;
         ps->lost_control_pdu            = default_lost_control_pdu;
-		if (ps->rtx_ctrl) {
-				ps->rtt_estimator = default_rtt_estimator;
-		} else {
-				ps->rtt_estimator = default_rtt_estimator_nortx;
-		}
+        if (ps->rtx_ctrl) {
+        	ps->rtt_estimator = default_rtt_estimator;
+        } else if (ps->flow_ctrl) {
+        	ps->rtt_estimator = default_rtt_estimator_nortx;
+        }
         ps->retransmission_timer_expiry = NULL;
         ps->received_retransmission     = NULL;
         ps->sender_ack                  = default_sender_ack;

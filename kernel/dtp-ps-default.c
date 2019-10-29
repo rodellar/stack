@@ -214,7 +214,7 @@ int default_sender_inactivity_timer(struct dtp_ps * ps)
         dtcp->sv->snd_rt_wind_edge = next_send + init_credit;
         dtcp->sv->rendezvous_sndr = false;
         if (dtp->rttq) {
-            rttq_flush(dtp->rttq);
+        	rttq_flush(dtp->rttq);
         }
 
         LOG_DBG("Current values:\n\tinit_credit: %u "

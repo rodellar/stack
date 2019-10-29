@@ -22,6 +22,7 @@
  */
 
 #include <linux/random.h>
+#include <linux/uaccess.h>
 #include <linux/version.h>
 
 #define RINA_PREFIX "dtp"
@@ -700,15 +701,16 @@ static void tf_a(struct timer_list * tl)
                 dtp_send_pending_ctrl_pdus(dtp);
         } else {
                 pci = process_A_expiration(dtp, dtcp);
-                if (pci) pci_release(pci);
-#if DTP_INACTIVITY_TIMERS_ENABLE
+
+                if (pci)
+                	pci_release(pci);
+
                 if (rtimer_restart(&dtp->timers.sender_inactivity,
                                    3 * (mpl + r + a))) {
                         LOG_ERR("Failed to start sender_inactiviy timer");
                         rtimer_start(&dtp->timers.a, a/AF);
                         return;
                 }
-#endif
         }
 
         if (!seqq_is_empty(dtp->seqq)) {
@@ -1057,6 +1059,8 @@ struct dtp * dtp_create(struct efcp *       efcp,
 
         dtp->cfg   = dtp_cfg;
         dtp->rmt  = rmt;
+        dtp->rttq = NULL;
+        dtp->rtxq = NULL;
         dtp->seqq = squeue_create(dtp);
         if (!dtp->seqq) {
                 LOG_ERR("Could not create Sequencing queue");
@@ -1135,8 +1139,8 @@ int dtp_destroy(struct dtp * instance)
         }
 
         if (instance->rttq) {
-        		rttq = instance->rttq;
-        		instance->rttq = NULL;
+        	rttq = instance->rttq;
+        	instance->rttq = NULL;
         }
 
         spin_unlock_bh(&instance->lock);
@@ -1163,10 +1167,10 @@ int dtp_destroy(struct dtp * instance)
         }
 
         if (rttq) {
-                if (rttq_destroy(rttq)) {
-                        LOG_ERR("Failed to destroy rexmsn queue");
-                        ret = -1;
-                }
+        	if (rttq_destroy(rttq)) {
+        		LOG_ERR("Failed to destroy rexmsn queue");
+        		ret = -1;
+        	}
         }
 
         rtimer_destroy(&instance->timers.a);
@@ -1256,7 +1260,6 @@ int dtp_write(struct dtp * instance,
               struct du * du)
 {
         struct dtcp *     dtcp;
-        struct rtxq *     rtxq;
         struct du *       cdu;
         struct dtp_ps *   ps;
         seq_num_t         sn, csn;
@@ -1269,13 +1272,10 @@ int dtp_write(struct dtp * instance,
         efcp = instance->efcp;
         dtcp = instance->dtcp;
 
-#if DTP_INACTIVITY_TIMERS_ENABLE
         /* Stop SenderInactivityTimer */
         if (rtimer_stop(&instance->timers.sender_inactivity)) {
                 LOG_ERR("Failed to stop timer");
         }
-#endif
-        /* Step 1: Delimiting (fragmentation/reassembly) + Protection */
 
         /*
          * FIXME: The two ways of carrying out flow control
@@ -1354,10 +1354,24 @@ int dtp_write(struct dtp * instance,
 				/* Check if rendezvous PDU needs to be sent*/
 				start_rv_timer = false;
 				spin_lock_bh(&instance->sv_lock);
+
+				/* If there is rtx control and PDUs at the rtxQ
+				 * don't enter the rendezvous state (DTCP will keep
+				 * retransmitting the PDUs until acked or the
+				 * retransmission timeout fires)
+				 */
+				if (instance->sv->rexmsn_ctrl &&
+						rtxq_size(instance->rtxq) > 0) {
+					LOG_DBG("Window is closed but there are PDUs at the RTXQ");
+					spin_unlock_bh(&instance->sv_lock);
+					return 0;
+				}
+
+				/* Else, check if rendezvous PDU needs to be sent */
 				if (!instance->dtcp->sv->rendezvous_sndr) {
 					instance->dtcp->sv->rendezvous_sndr = true;
 
-                                        LOG_INFO("RV at the sender %u (CPU: %d)", csn, smp_processor_id());
+					LOG_DBG("RV at the sender %u (CPU: %d)", csn, smp_processor_id());
 
 					/* Start rendezvous timer, wait for Tr to fire */
 					start_rv_timer = true;
@@ -1366,7 +1380,7 @@ int dtp_write(struct dtp * instance,
 				spin_unlock_bh(&instance->sv_lock);
 
 				if (start_rv_timer) {
-					LOG_INFO("Window is closed. SND LWE: %u | SND RWE: %u | TR: %u",
+					LOG_DBG("Window is closed. SND LWE: %u | SND RWE: %u | TR: %u",
 							instance->dtcp->sv->snd_lft_win,
 							instance->dtcp->sv->snd_rt_wind_edge,
 							instance->sv->tr);
@@ -1391,23 +1405,21 @@ int dtp_write(struct dtp * instance,
 			}
                 }
                 if (instance->sv->rexmsn_ctrl) {
-                        /* FIXME: Add timer for PDU */
-                        rtxq = instance->rtxq;
                         cdu = du_dup_ni(du);
                         if (!cdu) {
-                                LOG_ERR("Failed to copy PDU");
-                                LOG_ERR("PDU type: %d", pci_type(&du->pci));
+                                LOG_ERR("Failed to copy PDU. PDU type: %d",
+                                	 pci_type(&du->pci));
                                 goto pdu_stats_err_exit;
                         }
 
-                        if (rtxq_push_ni(rtxq, cdu)) {
+                        if (rtxq_push_ni(instance->rtxq, cdu)) {
                                 LOG_ERR("Couldn't push to rtxq");
                                 goto pdu_stats_err_exit;
                         }
-                } else {
-                		if (rttq_push(instance->rttq, csn)) {
-                				LOG_ERR("Failed to push SN");
-                		}
+                } else if (instance->rttq) {
+                	if (rttq_push(instance->rttq, csn)) {
+                		LOG_ERR("Failed to push SN to RTT queue");
+                	}
                 }
 
                 if (ps->transmission_control(ps, du)) {
@@ -1419,7 +1431,7 @@ int dtp_write(struct dtp * instance,
                 spin_lock_bh(&instance->sv_lock);
                 stats_inc_bytes(tx, instance->sv, sbytes);
                 spin_unlock_bh(&instance->sv_lock);
-#if DTP_INACTIVITY_TIMERS_ENABLE
+
                 /* Start SenderInactivityTimer */
                 if (rtimer_restart(&instance->timers.sender_inactivity,
                                    3 * (mpl + r + a ))) {
@@ -1427,7 +1439,7 @@ int dtp_write(struct dtp * instance,
                         goto stats_nounlock_err_exit;
                         return -1;
                 }
-#endif
+
                 return 0;
         }
 
@@ -1531,10 +1543,12 @@ int dtp_receive(struct dtp * instance,
         efcp = instance->efcp;
 
         spin_lock_bh(&instance->sv_lock);
+
         a           = instance->sv->A;
         r 	    = instance->sv->R;
         mpl	    = instance->sv->MPL;
         LWE         = instance->sv->rcv_left_window_edge;
+
         rcu_read_lock();
         ps = container_of(rcu_dereference(instance->base.ps),
                           struct dtp_ps, base);
@@ -1554,7 +1568,6 @@ int dtp_receive(struct dtp * instance,
                 seq_num, smp_processor_id());
 
         if (instance->sv->drf_required) {
-#if DTP_INACTIVITY_TIMERS_ENABLE
                 /* Start ReceiverInactivityTimer */
                 if (rtimer_restart(&instance->timers.receiver_inactivity,
                                    2 * (mpl + r + a))) {
@@ -1563,16 +1576,19 @@ int dtp_receive(struct dtp * instance,
                         du_destroy(du);
                         return -1;
                 }
-#endif
+
                 if ((pci_flags_get(&du->pci) & PDU_FLAGS_DATA_RUN)) {
-                	    LOG_INFO("Data Run Flag");
-                        instance->sv->drf_required = false;
+                	LOG_DBG("Data Run Flag");
+
+                	instance->sv->drf_required = false;
                         instance->sv->rcv_left_window_edge = seq_num;
                         dtp_squeue_flush(instance);
                         if (instance->rttq) {
-                                rttq_flush(instance->rttq);
+                        	rttq_flush(instance->rttq);
                         }
+
                         spin_unlock_bh(&instance->sv_lock);
+
                         if (dtcp) {
                                 if (dtcp_sv_update(dtcp, &du->pci)) {
                                         LOG_ERR("Failed to update dtcp sv");
@@ -1583,13 +1599,16 @@ int dtp_receive(struct dtp * instance,
                         dtp_send_pending_ctrl_pdus(instance);
                         pdu_post(instance, du);
 			stats_inc_bytes(rx, instance->sv, sbytes);
-                        LOG_DBG("Data run flag DRF");
+
                         return 0;
                 }
+
                 LOG_ERR("Expecting DRF but not present, dropping PDU %d...",
                         seq_num);
+
 		stats_inc(drop, instance->sv);
 		spin_unlock_bh(&instance->sv_lock);
+
                 du_destroy(du);
                 return 0;
         }
@@ -1599,14 +1618,15 @@ int dtp_receive(struct dtp * instance,
          *   no need to check presence of in_order or dtcp because in case
          *   they are not, LWE is not updated and always 0
          */
-
-        if ((seq_num <= LWE) || (is_fc_overrun(instance, dtcp, seq_num, sbytes)))
-        {
+        if ((seq_num <= LWE) ||
+        		(is_fc_overrun(instance, dtcp, seq_num, sbytes))) {
         	/* Duplicate PDU or flow control overrun */
-        	LOG_ERR("Duplicate PDU or flow control overrun. SN: %u, LWE:%u",
+        	LOG_ERR("Duplicate PDU or flow control overrun.SN: %u, LWE:%u",
         		 seq_num, LWE);
                 stats_inc(drop, instance->sv);
+
                 spin_unlock_bh(&instance->sv_lock);
+
                 du_destroy(du);
 
                 if (dtcp) {
@@ -1622,7 +1642,6 @@ int dtp_receive(struct dtp * instance,
                 return 0;
         }
 
-#if DTP_INACTIVITY_TIMERS_ENABLE
         /* Start ReceiverInactivityTimer */
         if (rtimer_restart(&instance->timers.receiver_inactivity,
                            2 * (mpl + r + a ))) {
@@ -1631,10 +1650,10 @@ int dtp_receive(struct dtp * instance,
                 du_destroy(du);
                 return -1;
         }
-#endif
+
         /* This is an acceptable data PDU, stop reliable ACK timer */
         if (dtcp->sv->rendezvous_rcvr) {
-        	LOG_INFO("RV at receiver put to false");
+        	LOG_DBG("RV at receiver put to false");
         	dtcp->sv->rendezvous_rcvr = false;
         	rtimer_stop(&dtcp->rendezvous_rcv);
         }
@@ -1703,6 +1722,7 @@ int dtp_receive(struct dtp * instance,
                 instance->sv->rcv_left_window_edge = seq_num;
                 ringq_push(instance->to_post, du);
         }
+
         spin_unlock_bh(&instance->sv_lock);
 
         if (dtcp) {
