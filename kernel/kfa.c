@@ -499,11 +499,13 @@ int kfa_flow_ub_write(struct kfa * instance,
 	if (!flow) {
 		spin_unlock_bh(&instance->lock);
 		LOG_ERR("There is no flow bound to port-id %d", id);
+		if (skb) kfree_skb(skb);
 		return -EBADF;
 	}
 	if (flow->state == PORT_STATE_DEALLOCATED) {
 		spin_unlock_bh(&instance->lock);
 		LOG_ERR("Flow with port-id %d is already deallocated", id);
+		if (skb) kfree_skb(skb);
 		return -ESHUTDOWN;
 	}
 
@@ -513,6 +515,7 @@ int kfa_flow_ub_write(struct kfa * instance,
 		spin_unlock_bh(&instance->lock);
 		LOG_ERR("SDU is larger than the max SDU handled by "
 				"the IPCP: %zd, %zd", max_sdu_size, left);
+		if (skb) kfree_skb(skb);
 	        return -EMSGSIZE;
 	}
 
@@ -526,33 +529,36 @@ int kfa_flow_ub_write(struct kfa * instance,
 		if (skb) {
 			/* This SDU comes from the networking stack */
 			du = du_create_from_skb(skb);
-			if (!du) kfree_skb(skb);
+			if (!du) {
+				kfree_skb(skb);
+				retval = -ENOMEM;
+				goto finish;
+			}
 		} else {
 			/* This SDU comes from the I/O device */
 			du = du_create(copylen);
-		}
+			if (!du) {
+				retval = -ENOMEM;
+				goto finish;
+			}
 
-		if (!du) {
-			retval = -ENOMEM;
-			goto finish;
-		}
+			/* NOTE: We don't handle partial copies */
+			retval = 0;
+			if (buffer) {
+				retval = copy_from_user(du_buffer(du),
+							buffer + data_written,
+							copylen);
+			} else {
+				if (copy_from_iter(du_buffer(du),
+						   copylen,
+						   iov) != copylen) retval = 1;
+			}
 
-		/* NOTE: We don't handle partial copies */
-		retval = 0;
-		if (buffer) {
-			retval = copy_from_user(du_buffer(du), 
-						buffer + data_written, 
-						copylen);
-		} else {
-			if (copy_from_iter(du_buffer(du), 
-					   copylen, 
-					   iov) != copylen) retval = 1;
-		}
-
-		if (retval) {
-			du_destroy(du);
-			retval = -EIO;
-			goto finish;
+			if (retval) {
+				du_destroy(du);
+				retval = -EIO;
+				goto finish;
+			}
 		}
 
 		spin_lock_bh(&instance->lock);
@@ -1121,11 +1127,10 @@ int kfa_flow_create(struct kfa           *instance,
 		flow->msg_boundaries = msg_boundaries;
 	}
 
-
 	spin_lock_bh(&instance->lock);
 
 	if (kfa_pmap_add_ni(instance->flows, pid, flow)) {
-		if (flow->ip_dev) rina_dev_destroy(flow->ip_dev);
+		/*if (flow->ip_dev) rina_dev_destroy(flow->ip_dev);*/
 		rkfree(flow);
 
 		spin_unlock_bh(&instance->lock);
